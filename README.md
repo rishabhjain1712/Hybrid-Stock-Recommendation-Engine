@@ -12,7 +12,6 @@ This project combines **technical analysis**, **data engineering**, and **machin
 - **Data Engineering**: `pandas`, `yfinance`, `requests`, time zone handling
 - **ML/AI**: `scikit-learn`, `keras`, `tensorflow`, `LSTM`, `LabelEncoder`
 - **Rule-Based System**: `ta` indicators, logic-based decision tree
-- **Visualization**: `matplotlib` (for architecture)
 
 ---
 
