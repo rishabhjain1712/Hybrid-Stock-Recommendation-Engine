@@ -1,177 +1,190 @@
+# script.py
+
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from ta.momentum import RSIIndicator, MFIIndicator
-from ta.volatility import BollingerBands, AverageTrueRange
-from ta.trend import CCIIndicator
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report
-from datetime import datetime, time
 import pytz
-import matplotlib.pyplot as plt
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+import requests
+from datetime import datetime, time
+from ta.momentum import RSIIndicator, MFIIndicator
+from ta.volatility import BollingerBands, AverageTrueRange, KeltnerChannel
+from ta.trend import CCIIndicator
+from sklearn.preprocessing import MinMaxScaler, LabelEncoder
+from sklearn.ensemble import RandomForestClassifier
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+from tensorflow.keras.optimizers import Adam
+import warnings
+warnings.filterwarnings("ignore")
 
-##############################################
-# Technical Indicators Feature Engineering
-##############################################
+# ------------------- Data Fetching -------------------
+def fetch_stock_data(tickers):
+    data = {}
+    for ticker in tickers:
+        try:
+            stock = yf.Ticker(ticker)
+            df = stock.history(period="2mo")
+            if not df.empty:
+                data[ticker] = df
+        except Exception as e:
+            print(f"Error fetching {ticker}: {e}")
+    return data
+
+def fetch_pre_market_data():
+    url = "https://www.nseindia.com/api/market-data-pre-open?key=ALL"
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://www.nseindia.com/",
+        "X-Requested-With": "XMLHttpRequest"
+    }
+    try:
+        session = requests.Session()
+        session.get("https://www.nseindia.com", headers=headers)
+        response = session.get(url, headers=headers)
+        data = response.json()
+        return {stock['metadata']['symbol']: stock['detail']['preOpenMarket']['IEP'] 
+                for stock in data['data'] if 'preOpenMarket' in stock.get('detail', {})}
+    except:
+        return {}
+
+# ------------------- Technical Indicators -------------------
 def technical_analysis(df):
     df['RSI'] = RSIIndicator(close=df['Close'], window=5).rsi()
     df['MFI'] = MFIIndicator(high=df['High'], low=df['Low'], close=df['Close'], volume=df['Volume'], window=5).money_flow_index()
-    df['ATR'] = AverageTrueRange(high=df['High'], low=df['Low'], close=df['Close'], window=5).average_true_range()
     df['CCI'] = CCIIndicator(high=df['High'], low=df['Low'], close=df['Close'], window=5).cci()
-    bb = BollingerBands(close=df['Close'], window=5)
+    bb = BollingerBands(close=df['Close'], window=5, window_dev=2)
     df['BB_Upper'] = bb.bollinger_hband()
     df['BB_Lower'] = bb.bollinger_lband()
     df['BB_Median'] = bb.bollinger_mavg()
-    df['BB_Width'] = bb.bollinger_hband() - bb.bollinger_lband()
+    kc = KeltnerChannel(high=df['High'], low=df['Low'], close=df['Close'], window=5)
+    df['KC_Upper'] = kc.keltner_channel_hband()
+    df['KC_Lower'] = kc.keltner_channel_lband()
+    df['ATR'] = AverageTrueRange(high=df['High'], low=df['Low'], close=df['Close'], window=5).average_true_range()
     return df.dropna()
 
-##############################################
-# Labeling for Multi-Class: Buy / Sell / Hold
-##############################################
-def label_trades(df):
-    future_return = (df['Close'].shift(-3) - df['Close']) / df['Close']
-    conditions = [
-        future_return > 0.01,
-        future_return < -0.01,
-        (future_return <= 0.01) & (future_return >= -0.01)
-    ]
-    choices = ['Buy', 'Sell', 'Hold']
-    df['Target'] = np.select(conditions, choices, default='Hold')
-    return df
+# ------------------- ML Preparation -------------------
+def prepare_ml_data(df):
+    features = ['RSI', 'MFI', 'CCI']
+    df = df.dropna()
+    df = df[features + ['Close']]
+    df['Target'] = df['Close'].shift(-1) - df['Close']
+    df['Label'] = df['Target'].apply(lambda x: 'Buy' if x > 0.5 else ('Sell' if x < -0.5 else 'Hold'))
+    df = df.dropna()
+    X = df[features]
+    y = LabelEncoder().fit_transform(df['Label'])
+    return X, y
 
-##############################################
-# LSTM Dataset
-##############################################
-class StockDataset(Dataset):
-    def __init__(self, df, seq_length=10):
-        self.features = ['RSI', 'MFI', 'ATR', 'CCI', 'BB_Width']
-        self.seq_length = seq_length
-        self.X, self.y = [], []
-        label_map = {'Buy': 0, 'Sell': 1, 'Hold': 2}
-        for i in range(len(df) - seq_length - 3):
-            window = df[self.features].iloc[i:i+seq_length].values
-            label = df['Target'].iloc[i + seq_length]
-            if label in label_map:
-                self.X.append(window)
-                self.y.append(label_map[label])
-        self.X = torch.tensor(self.X, dtype=torch.float32)
-        self.y = torch.tensor(self.y, dtype=torch.long)
+# ------------------- LSTM Preparation -------------------
+def prepare_lstm_data(df):
+    features = ['RSI', 'MFI', 'CCI']
+    scaler = MinMaxScaler()
+    scaled = scaler.fit_transform(df[features])
+    X, y = [], []
+    for i in range(10, len(df)-1):
+        X.append(scaled[i-10:i])
+        change = df['Close'].iloc[i+1] - df['Close'].iloc[i]
+        if change > 0.5: y.append("Buy")
+        elif change < -0.5: y.append("Sell")
+        else: y.append("Hold")
+    return np.array(X), LabelEncoder().fit_transform(y)
 
-    def __len__(self):
-        return len(self.X)
-
-    def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
-
-##############################################
-# LSTM Model
-##############################################
-class LSTMClassifier(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size):
-        super(LSTMClassifier, self).__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True)
-        self.fc = nn.Linear(hidden_size, output_size)
-
-    def forward(self, x):
-        _, (hn, _) = self.lstm(x)
-        return self.fc(hn[-1])
-
-##############################################
-# Train LSTM Model
-##############################################
-def train_lstm_model(df):
-    dataset = StockDataset(df)
-    dataloader = DataLoader(dataset, batch_size=16, shuffle=False)
-    model = LSTMClassifier(input_size=5, hidden_size=32, output_size=3)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-
-    model.train()
-    for epoch in range(10):
-        for X_batch, y_batch in dataloader:
-            optimizer.zero_grad()
-            outputs = model(X_batch)
-            loss = criterion(outputs, y_batch)
-            loss.backward()
-            optimizer.step()
-        print(f"Epoch {epoch+1}/10, Loss: {loss.item():.4f}")
-
+def train_lstm_model(X, y):
+    model = Sequential([
+        LSTM(32, input_shape=(X.shape[1], X.shape[2]), return_sequences=False),
+        Dense(16, activation='relu'),
+        Dense(3, activation='softmax')
+    ])
+    model.compile(loss='sparse_categorical_crossentropy', optimizer=Adam(0.001), metrics=['accuracy'])
+    model.fit(X, y, epochs=15, batch_size=16, verbose=0)
     return model
 
-##############################################
-# LSTM Predict
-##############################################
-def predict_lstm(model, df):
-    model.eval()
-    features = df[['RSI', 'MFI', 'ATR', 'CCI', 'BB_Width']].values[-10:]
-    X = torch.tensor(features, dtype=torch.float32).unsqueeze(0)
-    with torch.no_grad():
-        output = model(X)
-        pred = torch.argmax(output, dim=1).item()
-        prob = torch.softmax(output, dim=1).max().item()
-    label_map_rev = {0: 'Buy', 1: 'Sell', 2: 'Hold'}
-    return label_map_rev[pred], round(prob * 100, 2)
+# ------------------- Trade Logic -------------------
+def compute_trade_levels(entry, atr):
+    return {
+        "Entry": round(entry, 2),
+        "Exit_0.5%": round(entry + 0.005 * entry, 2),
+        "Exit_1%": round(entry + 0.01 * entry, 2),
+        "Exit_2%": round(entry + 0.02 * entry, 2),
+        "Stop_Loss": round(entry - 0.0035 * entry, 2)
+    }
 
-##############################################
-# Rule-Based Logic
-##############################################
 def rule_based_decision(df):
+    recent = df.iloc[-1]
+    if recent['Close'] > recent['BB_Upper'] and recent['RSI'] > 70:
+        return "Sell"
+    elif recent['Close'] < recent['BB_Lower'] and recent['RSI'] < 30:
+        return "Buy"
+    elif recent['KC_Lower'] < recent['Close'] < recent['KC_Upper']:
+        return "Hold"
+    return "Hold"
+
+# ------------------- Hybrid Decision -------------------
+def hybrid_recommendation(ticker, df, rf_model, lstm_model, pre_market_iep):
+    df = technical_analysis(df)
     last_close = df['Close'].iloc[-1]
-    bb_upper = df['BB_Upper'].iloc[-1]
-    bb_lower = df['BB_Lower'].iloc[-1]
-    bb_median = df['BB_Median'].iloc[-1]
-    slight_up = bb_upper * 1.001
-    slight_down = bb_lower * 0.999
+    atr = df['ATR'].iloc[-1]
+    entry_price = pre_market_iep if pre_market_iep else last_close
+    levels = compute_trade_levels(entry_price, atr)
 
-    if last_close > bb_upper and last_close < slight_up:
-        return 'Strong Buy'
-    elif last_close > bb_upper:
-        return 'Buy'
-    elif last_close < bb_lower and last_close > slight_down:
-        return 'Strong Sell'
-    elif last_close < bb_lower:
-        return 'Sell'
+    # ML Inference
+    X_rf, _ = prepare_ml_data(df)
+    rf_pred = rf_model.predict_proba([X_rf.iloc[-1]])[0]
+    rf_label = np.argmax(rf_pred)
+    rf_conf = rf_pred[rf_label]
+
+    X_lstm, _ = prepare_lstm_data(df)
+    lstm_pred = lstm_model.predict(np.expand_dims(X_lstm[-1], axis=0), verbose=0)[0]
+    lstm_label = np.argmax(lstm_pred)
+    lstm_conf = lstm_pred[lstm_label]
+
+    labels = ['Buy', 'Hold', 'Sell']
+    ml_label = labels[lstm_label]
+    ml_confidence = lstm_conf
+
+    if ml_confidence > 0.75:
+        decision = ml_label
+        source = "ML"
+        conf = ml_confidence
     else:
-        return 'Hold'
+        decision = rule_based_decision(df)
+        source = "Rule-Based"
+        conf = 0.0
 
-##############################################
-# Hybrid Decision with LSTM
-##############################################
-def hybrid_decision(df, lstm_model):
-    rule_action = rule_based_decision(df)
-    lstm_action, confidence = predict_lstm(lstm_model, df)
-    print(f"\n Rule-Based: {rule_action} |  LSTM: {lstm_action} ({confidence}%)")
+    return {
+        "Stock": ticker,
+        "Signal": decision,
+        "Confidence": round(conf * 100, 2),
+        **levels,
+        "Decision_Source": source
+    }
 
-    if confidence >= 75:
-        return lstm_action
-    else:
-        return rule_action
-
-##############################################
-# Main Execution
-##############################################
+# ------------------- Main -------------------
 if __name__ == "__main__":
-    tickers = ['TCS.NS', 'INFY.NS', 'RELIANCE.NS', 'HDFCBANK.NS', 'NMDC.NS', 'IDEA.NS', 'ZOMATO.NS',
-                      'VAKRANGEE.NS', 'JPPOWER.NS', 'TRANSRAILL.NS', 'ONGC.NS', 'VMM.NS', 'WELSPUNLIV.NS','BIOCON.NS',
-                      'BHEL.NS','JUBLFOOD.NS','IOC.NS', 'BPCL.NS', 'YESBANK.NS','IDFCFIRSTB.NS','TRIDENT.NS','NETWORK18.NS','BPCL.NS',
-                      'IOC.NS','NTPC.NS','GAIL.NS','BHEL.NS','ATGL.NS','EASEMYTRIP.NS','IOC.NS','IRFC.NS','BEL.NS','RPOWER.NS','ADANIPOWER.NS',
-                      'ITC.NS']
-    print("\nDownloading data and training LSTM...")
-    full_df = []
-    for ticker in tickers:
-        df = technical_analysis(yf.Ticker(ticker).history(period="6mo"))
-        df = label_trades(df)
-        full_df.append(df)
-    merged_df = pd.concat(full_df, ignore_index=True)
-    lstm_model = train_lstm_model(merged_df)
+    tickers = ['TCS.NS', 'INFY.NS', 'RELIANCE.NS', 'WIPRO.NS']
+    stock_data = fetch_stock_data(tickers)
+    pre_market_map = fetch_pre_market_data()
+    results = []
 
-    print("\n=== Final Hybrid Decisions ===")
     for ticker in tickers:
-        df = technical_analysis(yf.Ticker(ticker).history(period="1mo"))
-        df = label_trades(df)
-        decision = hybrid_decision(df, lstm_model)
-        print(f"📈 {ticker}: {decision}")
+        if ticker in stock_data:
+            df = stock_data[ticker]
+            df = technical_analysis(df)
+
+            X_rf, y_rf = prepare_ml_data(df)
+            if len(X_rf) < 20:
+                continue
+            rf_model = RandomForestClassifier(n_estimators=50, random_state=42)
+            rf_model.fit(X_rf, y_rf)
+
+            X_lstm, y_lstm = prepare_lstm_data(df)
+            if len(X_lstm) < 20:
+                continue
+            lstm_model = train_lstm_model(X_lstm, y_lstm)
+
+            symbol = ticker.replace(".NS", "")
+            iep = pre_market_map.get(symbol, None)
+            result = hybrid_recommendation(ticker, df, rf_model, lstm_model, iep)
+            results.append(result)
+
+    df_results = pd.DataFrame(results)
+    print(df_results)
