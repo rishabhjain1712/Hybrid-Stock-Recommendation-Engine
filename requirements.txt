@@ -1,0 +1,10 @@
+yfinance
+pandas
+numpy
+scikit-learn
+ta
+tensorflow
+keras
+matplotlib
+pytz
+requests
